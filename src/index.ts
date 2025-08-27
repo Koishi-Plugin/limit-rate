@@ -1,4 +1,4 @@
-import { Argv, Computed, Context, Schema, Session } from 'koishi'
+import { Argv, Computed, Context, Schema, Session, Command } from 'koishi'
 
 // 扩展指令配置项
 declare module 'koishi' {
@@ -175,15 +175,25 @@ export function apply(ctx: Context, config: Config) {
 
     const minInterval = session.resolve(command.config.minInterval)
     const maxUsage = session.resolve(command.config.maxUsage)
-
     if (!minInterval && !maxUsage) return
 
-    const name = command.name.replace(/\./g, ':')
+    let effectiveCommand: Command = command
+    while (effectiveCommand.parent) {
+      const currentMinInterval = session.resolve(effectiveCommand.config.minInterval)
+      const currentMaxUsage = session.resolve(effectiveCommand.config.maxUsage)
+      const parentMinInterval = session.resolve(effectiveCommand.parent.config.minInterval)
+      const parentMaxUsage = session.resolve(effectiveCommand.parent.config.maxUsage)
+
+      if (currentMinInterval === parentMinInterval && currentMaxUsage === parentMaxUsage) {
+        effectiveCommand = effectiveCommand.parent
+      } else {
+        break
+      }
+    }
+    const name = effectiveCommand.name.replace(/\./g, ':')
     const result = checkRateLimit(commandRecords, session, config.scope, name, minInterval, maxUsage)
 
-    if (result) {
-      return config.sendHint ? result : ''
-    }
+    if (result) return config.sendHint ? result : ''
   })
 
   // 中间件处理
