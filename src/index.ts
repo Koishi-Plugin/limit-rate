@@ -92,13 +92,13 @@ export function apply(ctx: Context, config: Config) {
 
   // 扩展指令配置项
   ctx.schema.extend('command', Schema.object({
-    scope: Schema.computed(Schema.union([
+    scope: Schema.union([
       Schema.const('platform').description('平台'),
       Schema.const('channel').description('频道'),
       Schema.const('user').description('用户'),
-    ])).default('channel').description('频率限制范围'),
+    ]).default('channel').description('频率限制范围'),
     maxDayUsage: Schema.computed(Schema.number()).default(0).description('每日次数限制'),
-    minInterval: Schema.computed(Schema.number()).default(0).description('连续调用间隔 (秒)'),
+    minInterval: Schema.computed(Schema.number()).default(0).description('连续调用间隔'),
   }), 800)
 
   /**
