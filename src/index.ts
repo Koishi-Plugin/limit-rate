@@ -1,53 +1,56 @@
 import { Argv, Computed, Context, Schema, Session, Command } from 'koishi'
 
-// 扩展指令配置项
+/** 频率限制的作用范围 */
+type Scope = 'platform' | 'channel' | 'user'
+/** 对用户或频道的具体行为 */
+type Action = 'block' | 'limit' | 'ignore'
+
+/**
+ * 存储指令使用情况的记录
+ */
+interface UsageRecord {
+  /** 冷却到期时间戳 */
+  cooldownExpiresAt?: number
+  /** 当日剩余使用次数 */
+  dailyUsesLeft?: number
+  /** 当日使用次数重置时间戳 */
+  dailyResetAt?: number
+}
+
+/**
+ * 指令过滤规则，用于设置豁免（白名单）或限制（黑名单）
+ */
+interface CommandFilterRule {
+  /** 规则应用的类型 */
+  type: 'user' | 'channel'
+  /** 规则应用的目标 ID (用户 ID 或频道 ID) */
+  content: string
+  /** 对目标执行的行为 */
+  action: 'block' | 'ignore'
+}
+
 declare module 'koishi' {
   namespace Command {
     interface Config {
-      maxUsage?: Computed<number>
+      /* 每日最大使用次数 */
+      maxDayUsage?: Computed<number>
+      /* 最小调用间隔 */
       minInterval?: Computed<number>
+      /* 频率限制的生效范围 */
+      scope?: Computed<Scope>
     }
   }
 }
 
-// 使用记录的接口
-interface UsageRecord {
-  cooldownExpiresAt?: number
-  dailyUsesLeft?: number
-  dailyResetAt?: number
-}
-
-// 指令规则接口
-interface CommandFilterRule {
-  type: 'user' | 'channel'
-  content: string
-}
-
-// 中间件限制规则接口
-interface MiddlewareLimitRule {
-  content: string
-  maxUsage?: number
-  minInterval?: number
-}
-
-// 中间件规则接口
-interface CompiledMiddlewareRule extends MiddlewareLimitRule {
-  regex: RegExp
-}
-
-// 插件主配置项
 export interface Config {
-  scope?: 'user' | 'channel' | 'global'
+  /** 是否在触发频率限制时发送提示 */
   sendHint?: boolean
-  // 指令相关配置
-  defaultAction?: 'limit' | 'ignore'
+  /** 指令过滤的例外规则列表 */
   commandRules?: CommandFilterRule[]
-  // 中间件相关配置
-  limitMiddleware?: boolean
-  middlewareRules?: MiddlewareLimitRule[]
 }
 
-// 插件说明和支持信息
+export const name = 'rate-limit'
+
 export const usage = `
 <div style="border-radius: 10px; border: 1px solid #ddd; padding: 16px; margin-bottom: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.1);">
   <h2 style="margin-top: 0; color: #4a6ee0;">📌 插件说明</h2>
@@ -61,157 +64,132 @@ export const usage = `
 </div>
 `
 
-export const name = 'rate-limit'
-
-// 配置项 Schema 定义
-export const Config: Schema<Config> = Schema.intersect([
-  Schema.object({
-    scope: Schema.union([
+export const Config: Schema<Config> = Schema.object({
+  sendHint: Schema.boolean().default(false).description('发送限流提示'),
+  commandRules: Schema.array(Schema.object({
+    type: Schema.union([
       Schema.const('user').description('用户'),
       Schema.const('channel').description('频道'),
-      Schema.const('global').description('全局'),
-    ]).default('user').description('频率限制范围'),
-    sendHint: Schema.boolean().default(false).description('发送消息提示'),
-  }).description('基础设置'),
-  Schema.object({
-    defaultAction: Schema.union([
-      Schema.const('limit').description('限制'),
+    ]).default('user').description('类型'),
+    content: Schema.string().description('ID').required(),
+    action: Schema.union([
+      Schema.const('block').description('限制'),
       Schema.const('ignore').description('豁免'),
-    ]).default('limit').description('默认行为'),
-    commandRules: Schema.array(Schema.object({
-      type: Schema.union([
-        Schema.const('user').description('用户 ID'),
-        Schema.const('channel').description('频道 ID'),
-      ]).default('user').description('类型'),
-      content: Schema.string().description('内容'),
-    })).role('table').description('例外列表'),
-  }).description('指令限制'),
-  Schema.object({
-    limitMiddleware: Schema.boolean().default(false).description('限制非指令频率'),
-    middlewareRules: Schema.array(Schema.object({
-      content: Schema.string().description('匹配正则'),
-      maxUsage: Schema.number().default(0).description('每日次数限制'),
-      minInterval: Schema.number().default(5).description('连续调用间隔（秒）'),
-    })).role('table').description('规则列表'),
-  }).description('中间件限制')
-])
+    ]).default('ignore').description('行为'),
+  })).role('table').description('例外规则'),
+})
 
+/**
+ * 插件主逻辑
+ * @param ctx Koishi 上下文
+ * @param config 插件配置
+ */
 export function apply(ctx: Context, config: Config) {
-  const commandRecords = new Map<string, Map<string, UsageRecord>>()
-  const middlewareRecords = new Map<string, Map<string, UsageRecord>>()
+  const commandRecords = new Map<string, UsageRecord>()
+  const rules = new Map<string, Action>()
 
-  const userRuleSet = new Set<string>()
-  const channelRuleSet = new Set<string>()
-  for (const rule of (config.commandRules || [])) {
-    if (rule.type === 'user') {
-      userRuleSet.add(rule.content)
-    } else {
-      channelRuleSet.add(rule.content)
-    }
-  }
+  for (const rule of config.commandRules ?? []) rules.set(`${rule.type}:${rule.content}`, rule.action)
 
-  const compiledMiddlewareRules: CompiledMiddlewareRule[] = (config.middlewareRules || []).map(rule => {
-    try {
-      return { ...rule, regex: new RegExp(rule.content) }
-    } catch (e) {
-      ctx.logger.warn(`无效正则表达式"${rule.content}": ${e.message}`)
-      return null
-    }
-  }).filter(Boolean)
-
+  // 扩展指令配置项
   ctx.schema.extend('command', Schema.object({
-    maxUsage: Schema.computed(Schema.number()).default(0).description('每日次数限制'),
-    minInterval: Schema.computed(Schema.number()).default(0).description('连续调用间隔（秒）'),
+    scope: Schema.computed(Schema.union([
+      Schema.const('platform').description('平台'),
+      Schema.const('channel').description('频道'),
+      Schema.const('user').description('用户'),
+    ])).default('channel').description('频率限制范围'),
+    maxDayUsage: Schema.computed(Schema.number()).default(0).description('每日次数限制'),
+    minInterval: Schema.computed(Schema.number()).default(0).description('连续调用间隔 (秒)'),
   }), 800)
 
   /**
-   * 核心检查函数，处理冷却和使用次数
-   * @returns 若被限流则返回提示字符串，否则返回 undefined
+   * 根据会话和作用范围生成唯一的记录键
+   * @param session 当前会话
+   * @param scope 作用范围
+   * @returns 记录键 (string) 或 undefined
    */
-  function checkRateLimit(records: Map<string, Map<string, UsageRecord>>, session: Session, scope: 'user' | 'channel' | 'global', name: string, minInterval: number, maxUsage: number): string | undefined {
-    if (!minInterval && !maxUsage) return
+  function getRecordKey(session: Session, scope: Scope): string | undefined {
+    switch (scope) {
+      case 'user': return session.userId
+      case 'channel': return session.channelId
+      case 'platform': return session.platform
+      default: return undefined
+    }
+  }
 
-    // 确定记录ID
-    const recordId = scope === 'global' ? 'global' : `${scope}:${scope === 'user' ? session.userId : session.channelId}`
-    if (scope !== 'global' && !recordId.split(':')[1]) return
+  /**
+   * 检查并更新指令的调用频率和次数
+   * @param session 当前会话
+   * @param commandName 指令名称
+   * @param scope 作用范围
+   * @param minInterval 最小调用间隔
+   * @param maxDayUsage 每日最大使用次数
+   * @returns 如果被限流，则返回提示信息；否则返回 undefined
+   */
+  function checkRateLimit(session: Session, commandName: string, scope: Scope, minInterval: number, maxDayUsage: number): string | undefined {
+    const key = getRecordKey(session, scope)
+    if (!key) return
 
+    const recordId = `${scope}:${key}:${commandName}`
     const now = Date.now()
-
-    let userOrChannelRecords = records.get(recordId)
-    if (!userOrChannelRecords) records.set(recordId, userOrChannelRecords = new Map())
-
-    let record = userOrChannelRecords.get(name)
-    if (!record) userOrChannelRecords.set(name, record = {})
+    const record = commandRecords.get(recordId) ?? {}
 
     // 检查冷却时间
-    if (minInterval > 0 && record.cooldownExpiresAt && now < record.cooldownExpiresAt) {
+    if (minInterval > 0 && record.cooldownExpiresAt && record.cooldownExpiresAt > now) {
       const remaining = Math.ceil((record.cooldownExpiresAt - now) / 1000)
-      return `操作过于频繁，请在 ${remaining} 秒后重试`
+      return `操作过于频繁，请 ${remaining} 秒后重试`
     }
 
     // 检查每日使用次数
-    if (maxUsage > 0) {
+    if (maxDayUsage > 0) {
       if (!record.dailyResetAt || now > record.dailyResetAt) {
-        record.dailyUsesLeft = maxUsage
         const tomorrow = new Date()
         tomorrow.setHours(24, 0, 0, 0)
         record.dailyResetAt = tomorrow.getTime()
+        record.dailyUsesLeft = maxDayUsage
       }
-      if (record.dailyUsesLeft <= 0) {
-        return `今日使用次数已达上限`
-      }
+      if (record.dailyUsesLeft <= 0) return `使用已达上限，请明日再试`
     }
 
     // 更新记录
     if (minInterval > 0) record.cooldownExpiresAt = now + minInterval * 1000
-    if (maxUsage > 0) record.dailyUsesLeft--
+    if (maxDayUsage > 0) record.dailyUsesLeft--
+    commandRecords.set(recordId, record)
+    return undefined
   }
 
-  // 指令执行前检查
-  ctx.before('command/execute', ({ session, command }: Argv) => {
-    const isMatch = userRuleSet.has(session.userId) || channelRuleSet.has(session.channelId)
-    const shouldLimit = (config.defaultAction === 'limit') !== isMatch
-    if (!shouldLimit) return
+  /**
+   * 根据配置的规则获取对当前会话生效的行为
+   * @param session 当前会话
+   * @returns 'block' (阻止), 'ignore' (忽略限制), 或 'limit' (应用限制)
+   */
+  function getEffectiveAction(session: Session): Action {
+    return rules.get(`user:${session.userId}`)
+      ?? rules.get(`channel:${session.channelId}`)
+      ?? 'limit'
+  }
 
-    const minInterval = session.resolve(command.config.minInterval)
-    const maxUsage = session.resolve(command.config.maxUsage)
-    if (!minInterval && !maxUsage) return
+  // 在指令执行前进行前置处理
+  ctx.before('command/execute', (argv: Argv) => {
+    const { session, command } = argv
+    const action = getEffectiveAction(session)
 
-    let effectiveCommand: Command = command
-    while (effectiveCommand.parent) {
-      const currentMinInterval = session.resolve(effectiveCommand.config.minInterval)
-      const currentMaxUsage = session.resolve(effectiveCommand.config.maxUsage)
-      const parentMinInterval = session.resolve(effectiveCommand.parent.config.minInterval)
-      const parentMaxUsage = session.resolve(effectiveCommand.parent.config.maxUsage)
+    // 如果规则为 'ignore'，则直接跳过所有限制
+    if (action === 'ignore') return
+    // 如果规则为 'block'，则直接阻止指令执行
+    if (action === 'block') return ''
 
-      if (currentMinInterval === parentMinInterval && currentMaxUsage === parentMaxUsage) {
-        effectiveCommand = effectiveCommand.parent
-      } else {
-        break
-      }
+    // 遍历指令及其父指令，检查是否配置了频率限制
+    for (let cmd: Command = command; cmd; cmd = cmd.parent) {
+      const minInterval = session.resolve(cmd.config.minInterval)
+      const maxDayUsage = session.resolve(cmd.config.maxDayUsage)
+      if (!minInterval && !maxDayUsage) continue
+
+      const scope = session.resolve(cmd.config.scope)
+      const name = cmd.name.replace(/\./g, ':')
+      const result = checkRateLimit(session, name, scope, minInterval, maxDayUsage)
+
+      // 如果触发限流，则根据配置决定是否发送提示
+      if (result) return config.sendHint ? result : ''
     }
-    const name = effectiveCommand.name.replace(/\./g, ':')
-    const result = checkRateLimit(commandRecords, session, config.scope, name, minInterval, maxUsage)
-
-    if (result) return config.sendHint ? result : ''
   })
-
-  // 中间件处理
-  if (config.limitMiddleware) {
-    ctx.middleware((session, next) => {
-      if (!compiledMiddlewareRules.length || session.argv || !session.content) return next()
-
-      for (let i = 0; i < compiledMiddlewareRules.length; i++) {
-        const rule = compiledMiddlewareRules[i]
-        if (rule.regex.test(session.content)) {
-          const result = checkRateLimit(middlewareRecords, session, config.scope, `middleware-rule:${i}`, rule.minInterval, rule.maxUsage)
-          if (result !== undefined) {
-            // 一旦被任何一个规则限流，立即返回结果
-            return config.sendHint ? result : ''
-          }
-        }
-      }
-      return next()
-    }, true)
-  }
 }
