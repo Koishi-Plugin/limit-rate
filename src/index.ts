@@ -71,14 +71,10 @@ export function apply(ctx: Context, config: Config) {
   }), 800)
 
   ctx.middleware((session, next) => {
-    const action = config.commandRules?.find(rule =>
-      (rule.type === 'user' && rule.content === session.userId) ||
-      (rule.type === 'channel' && rule.content === session.channelId)
-    )?.action
-    if (action === 'block') {
-      logger.info(`[${session.userId || session.channelId}] 中间件已拦截`)
-      return
-    }
+    if (session.type !== 'message') return next()
+    const matchedRule = config.commandRules?.find(rule => rule.type === 'user' && rule.content === session.userId)
+                     || config.commandRules?.find(rule => rule.type === 'channel' && rule.content === session.channelId)
+    if (matchedRule?.action === 'block') return
     return next()
   }, true)
 
@@ -87,13 +83,12 @@ export function apply(ctx: Context, config: Config) {
     const { session, command } = argv
     if (!session?.userId || !command) return
     const { userId, channelId, platform } = session
-    const action = config.commandRules?.find(rule =>
-      (rule.type === 'user' && rule.content === userId) ||
-      (rule.type === 'channel' && rule.content === channelId)
-    )?.action ?? 'limit'
+    const matchedRule = config.commandRules?.find(rule => rule.type === 'user' && rule.content === userId)
+                     || config.commandRules?.find(rule => rule.type === 'channel' && rule.content === channelId)
+    const action = matchedRule?.action ?? 'limit'
     if (action === 'ignore') return
     if (action === 'block') return ''
-    logger.info(`[${command.name}] ${userId} 触发指令: ${action}`)
+    logger.info(`[${command.name}] ${userId} 触发指令`)
     const now = Date.now()
     const today = new Date().toISOString().slice(0, 10)
     let cmd: Command | undefined = command
@@ -108,6 +103,8 @@ export function apply(ctx: Context, config: Config) {
           const record = commandRecords.get(recordId) ?? { dailyCount: 0, lastResetDay: today }
           record.dailyCount ??= 0
           record.lastResetDay ??= today
+          const lastUsedStr = record.lastUsedAt ? new Date(record.lastUsedAt).toLocaleString() : '无'
+          logger.info(`[${cmd.name}] 范围:${scope} | 配置:[间隔 ${minInterval}s | 上限 ${maxDayUsage}] | 状态:[已用 ${record.dailyCount} | 上次 ${lastUsedStr}]`)
           if (minInterval > 0 && record.lastUsedAt) {
             const cooldownTime = record.lastUsedAt + minInterval * 1000
             if (cooldownTime > now) {
