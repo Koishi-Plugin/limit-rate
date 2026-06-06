@@ -61,11 +61,11 @@ export function apply(ctx: Context, config: Config) {
   const commandRecords = new Map<string, UsageRecord>()
 
   ctx.schema.extend('command', Schema.object({
-    scope: Schema.computed(Schema.union([
+    scope: Schema.union([
       Schema.const('none').description('无'),
       Schema.const('channel').description('频道'),
       Schema.const('user').description('用户'),
-    ])).default('none').description('频率限制范围'),
+    ]).default('none').description('频率限制范围'),
     maxDayUsage: Schema.computed(Schema.number()).default(0).description('每日次数限制'),
     minInterval: Schema.computed(Schema.number()).default(0).description('连续调用间隔'),
   }), 800)
