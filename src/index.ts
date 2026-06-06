@@ -61,11 +61,11 @@ export function apply(ctx: Context, config: Config) {
   const commandRecords = new Map<string, UsageRecord>()
 
   ctx.schema.extend('command', Schema.object({
-    scope: Schema.union([
+    scope: Schema.computed(Schema.union([
       Schema.const('platform').description('平台'),
       Schema.const('channel').description('频道'),
       Schema.const('user').description('用户'),
-    ]).default('channel').description('频率限制范围'),
+    ])).default('channel').description('频率限制范围'),
     maxDayUsage: Schema.computed(Schema.number()).default(0).description('每日次数限制'),
     minInterval: Schema.computed(Schema.number()).default(0).description('连续调用间隔'),
   }), 800)
@@ -74,7 +74,10 @@ export function apply(ctx: Context, config: Config) {
     if (session.type !== 'message') return next()
     const matchedRule = config.commandRules?.find(rule => rule.type === 'user' && rule.content === session.userId)
                      || config.commandRules?.find(rule => rule.type === 'channel' && rule.content === session.channelId)
-    if (matchedRule?.action === 'block') return
+    if (matchedRule?.action === 'block') {
+      logger.info(`[${session.userId || session.channelId}] 中间件已拦截`)
+      return
+    }
     return next()
   }, true)
 
@@ -92,12 +95,17 @@ export function apply(ctx: Context, config: Config) {
     const now = Date.now()
     const today = new Date().toISOString().slice(0, 10)
     let cmd: Command | undefined = command
+    const resolveComputed = <T>(val: Computed<T> | undefined, fallback: T): T => {
+      if (val === undefined || val === null) return fallback
+      const res = session.resolve(val)
+      return res === undefined || res === null ? fallback : res
+    }
     while (cmd) {
-      const minInterval = session.resolve(cmd.config.minInterval) ?? 0
-      const maxDayUsage = session.resolve(cmd.config.maxDayUsage) ?? 0
+      const minInterval = resolveComputed(cmd.config.minInterval, 0)
+      const maxDayUsage = resolveComputed(cmd.config.maxDayUsage, 0)
       if (minInterval > 0 || maxDayUsage > 0) {
-        const scope = session.resolve(cmd.config.scope) ?? 'channel'
-        const key = scope === 'user' ? userId : scope === 'channel' ? channelId : platform
+        const scope = resolveComputed(cmd.config.scope, 'channel')
+        const key = scope === 'user' ? userId : scope === 'channel' ? (channelId || userId) : platform
         if (key) {
           const recordId = `${scope}:${key}:${cmd.name}`
           const record = commandRecords.get(recordId) ?? { dailyCount: 0, lastResetDay: today }
