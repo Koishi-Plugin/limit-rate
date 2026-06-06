@@ -1,4 +1,4 @@
-import { Argv, Computed, Context, Schema, Command, Logger } from 'koishi'
+import { Argv, Computed, Context, Schema, Command } from 'koishi'
 
 interface UsageRecord {
   lastUsedAt?: number
@@ -26,8 +26,6 @@ export interface Config {
   sendHint?: boolean
   commandRules?: CommandFilterRule[]
 }
-
-const logger = new Logger('limit-rate')
 
 export const usage = `
 <div style="border-radius: 10px; border: 1px solid #ddd; padding: 16px; margin-bottom: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.1);">
@@ -77,7 +75,6 @@ export function apply(ctx: Context, config: Config) {
     return next()
   }, true)
 
-
   ctx.before('command/execute', (argv: Argv) => {
     const { session, command } = argv
     if (!session?.userId || !command) return
@@ -87,7 +84,6 @@ export function apply(ctx: Context, config: Config) {
     const action = matchedRule?.action ?? 'limit'
     if (action === 'ignore') return
     if (action === 'block') return ''
-    logger.info(`[${command.name}] ${userId} 触发指令`)
     const now = Date.now()
     const today = new Date().toISOString().slice(0, 10)
     let cmd: Command | undefined = command
@@ -110,13 +106,10 @@ export function apply(ctx: Context, config: Config) {
           const record = commandRecords.get(recordId) ?? { dailyCount: 0, lastResetDay: today }
           record.dailyCount ??= 0
           record.lastResetDay ??= today
-          const lastUsedStr = record.lastUsedAt ? new Date(record.lastUsedAt).toLocaleString() : '无'
-          logger.info(`[${cmd.name}] 范围:${scope} | 配置:[间隔 ${minInterval}s | 上限 ${maxDayUsage}] | 状态:[已用 ${record.dailyCount} | 上次 ${lastUsedStr}]`)
           if (minInterval > 0 && record.lastUsedAt) {
             const cooldownTime = record.lastUsedAt + minInterval * 1000
             if (cooldownTime > now) {
               const remaining = Math.ceil((cooldownTime - now) / 1000)
-              logger.info(`[${cmd.name}] 触发 ${remaining}s 冷却`)
               return config.sendHint ? `操作过于频繁，请等 ${remaining} 秒后重试` : ''
             }
           }
@@ -126,7 +119,6 @@ export function apply(ctx: Context, config: Config) {
               record.dailyCount = 0
             }
             if (record.dailyCount >= maxDayUsage) {
-              logger.info(`[${cmd.name}] 触发上限`)
               return config.sendHint ? `今日使用 ${cmd.name} 达到上限，请明日再试` : ''
             }
           }
