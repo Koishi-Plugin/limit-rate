@@ -6,12 +6,6 @@ interface UsageRecord {
   lastResetDay?: string
 }
 
-interface CommandFilterRule {
-  type: 'user' | 'channel'
-  content: string
-  action: 'block' | 'ignore'
-}
-
 declare module 'koishi' {
   namespace Command {
     interface Config {
@@ -25,7 +19,6 @@ declare module 'koishi' {
 export interface Config {
   sendHint?: boolean
   debugMode?: boolean
-  commandRules?: CommandFilterRule[]
 }
 
 const logger = new Logger('limit-rate')
@@ -46,17 +39,6 @@ export const usage = `
 export const Config: Schema<Config> = Schema.object({
   sendHint: Schema.boolean().default(false).description('发送提示'),
   debugMode: Schema.boolean().default(false).description('调试输出'),
-  commandRules: Schema.array(Schema.object({
-    type: Schema.union([
-      Schema.const('user').description('用户'),
-      Schema.const('channel').description('频道'),
-    ]).default('user').description('类型'),
-    content: Schema.string().description('ID').required(),
-    action: Schema.union([
-      Schema.const('block').description('限制'),
-      Schema.const('ignore').description('豁免'),
-    ]).default('ignore').description('行为'),
-  })).role('table').description('例外规则'),
 })
 
 export function apply(ctx: Context, config: Config) {
@@ -72,22 +54,10 @@ export function apply(ctx: Context, config: Config) {
     minInterval: Schema.computed(Schema.number()).default(0).description('连续调用间隔'),
   }), 800)
 
-  ctx.middleware((session, next) => {
-    const matchedRule = config.commandRules?.find(rule => rule.type === 'user' && rule.content === session.userId)
-                     || config.commandRules?.find(rule => rule.type === 'channel' && rule.content === session.channelId)
-    if (matchedRule?.action === 'block') return
-    return next()
-  }, true)
-
   ctx.before('command/execute', (argv: Argv) => {
     const { session, command } = argv
     if (!session?.userId || !command) return
     const { userId, channelId } = session
-    const matchedRule = config.commandRules?.find(rule => rule.type === 'user' && rule.content === userId)
-                     || config.commandRules?.find(rule => rule.type === 'channel' && rule.content === channelId)
-    const action = matchedRule?.action ?? 'limit'
-    if (action === 'ignore') return
-    if (action === 'block') return ''
     if (config.debugMode) logger.info(`[${command.name}] ${userId} 触发指令`)
     const now = Date.now()
     const today = new Date().toISOString().slice(0, 10)
