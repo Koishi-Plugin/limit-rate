@@ -1,4 +1,4 @@
-import { Argv, Computed, Context, Schema, Command } from 'koishi'
+import { Argv, Computed, Context, Schema, Command, Logger } from 'koishi'
 
 interface UsageRecord {
   lastUsedAt?: number
@@ -24,8 +24,11 @@ declare module 'koishi' {
 
 export interface Config {
   sendHint?: boolean
+  debugMode?: boolean
   commandRules?: CommandFilterRule[]
 }
+
+const logger = new Logger('limit-rate')
 
 export const usage = `
 <div style="border-radius: 10px; border: 1px solid #ddd; padding: 16px; margin-bottom: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.1);">
@@ -42,6 +45,7 @@ export const usage = `
 
 export const Config: Schema<Config> = Schema.object({
   sendHint: Schema.boolean().default(false).description('发送提示'),
+  debugMode: Schema.boolean().default(false).description('调试输出'),
   commandRules: Schema.array(Schema.object({
     type: Schema.union([
       Schema.const('user').description('用户'),
@@ -84,53 +88,82 @@ export function apply(ctx: Context, config: Config) {
     const action = matchedRule?.action ?? 'limit'
     if (action === 'ignore') return
     if (action === 'block') return ''
+    if (config.debugMode) logger.info(`[${command.name}] ${userId} 触发指令`)
     const now = Date.now()
     const today = new Date().toISOString().slice(0, 10)
     let cmd: Command | undefined = command
-    const updates: Array<{ recordId: string; record: UsageRecord; maxDayUsage: number }> = []
+    const cmds: Command[] = []
     while (cmd) {
-      const minInterval = session.resolve(cmd.config.minInterval) ?? 0
-      const maxDayUsage = session.resolve(cmd.config.maxDayUsage) ?? 0
+      cmds.push(cmd)
+      cmd = cmd.parent
+    }
+
+    for (const c of cmds) {
+      const minInterval = session.resolve(c.config.minInterval) ?? 0
+      const maxDayUsage = session.resolve(c.config.maxDayUsage) ?? 0
       if (minInterval > 0 || maxDayUsage > 0) {
-        const scope = session.resolve(cmd.config.scope) ?? 'channel'
+        const scope = session.resolve(c.config.scope) ?? 'channel'
         let key: string | undefined
         if (scope === 'user') {
-          key = userId
+          key = `${session.platform}:${userId}`
         } else if (scope === 'channel') {
-          key = channelId || userId
+          key = `${session.platform}:${channelId || userId}`
         } else if (scope === 'platform') {
           key = session.platform
         }
         if (key) {
-          const recordId = `${scope}:${key}:${cmd.name}`
+          const recordId = `${scope}:${key}:${c.name}`
+          const record = commandRecords.get(recordId)
+          if (record) {
+            if (minInterval > 0 && record.lastUsedAt) {
+              const cooldownTime = record.lastUsedAt + minInterval * 1000
+              if (cooldownTime > now) {
+                const remaining = Math.ceil((cooldownTime - now) / 1000)
+                if (config.debugMode) logger.info(`[${c.name}] 触发 ${remaining}s 冷却`)
+                return config.sendHint ? `操作过于频繁，请等 ${remaining} 秒后重试` : ''
+              }
+            }
+            if (maxDayUsage > 0) {
+              if (record.lastResetDay === today && (record.dailyCount ?? 0) >= maxDayUsage) {
+                if (config.debugMode) logger.info(`[${c.name}] 触发上限`)
+                return config.sendHint ? `今日使用 ${c.name} 达到上限，请明日再试` : ''
+              }
+            }
+          }
+        }
+      }
+    }
+    for (const c of cmds) {
+      const minInterval = session.resolve(c.config.minInterval) ?? 0
+      const maxDayUsage = session.resolve(c.config.maxDayUsage) ?? 0
+      if (minInterval > 0 || maxDayUsage > 0) {
+        const scope = session.resolve(c.config.scope) ?? 'channel'
+        let key: string | undefined
+        if (scope === 'user') {
+          key = `${session.platform}:${userId}`
+        } else if (scope === 'channel') {
+          key = `${session.platform}:${channelId || userId}`
+        } else if (scope === 'platform') {
+          key = session.platform
+        }
+        if (key) {
+          const recordId = `${scope}:${key}:${c.name}`
           const record = commandRecords.get(recordId) ?? { dailyCount: 0, lastResetDay: today }
           record.dailyCount ??= 0
           record.lastResetDay ??= today
-          if (minInterval > 0 && record.lastUsedAt) {
-            const cooldownTime = record.lastUsedAt + minInterval * 1000
-            if (cooldownTime > now) {
-              const remaining = Math.ceil((cooldownTime - now) / 1000)
-              return config.sendHint ? `操作过于频繁，请等 ${remaining} 秒后重试` : ''
-            }
-          }
+          const lastUsedStr = record.lastUsedAt ? new Date(record.lastUsedAt).toLocaleString() : '无'
+          if (config.debugMode) logger.info(`[${c.name}] 范围:${scope} | 配置:[间隔 ${minInterval}s | 上限 ${maxDayUsage}] | 状态:[已用 ${record.dailyCount} | 上次 ${lastUsedStr}]`)
           if (maxDayUsage > 0) {
             if (record.lastResetDay !== today) {
               record.lastResetDay = today
               record.dailyCount = 0
             }
-            if (record.dailyCount >= maxDayUsage) {
-              return config.sendHint ? `今日使用 ${cmd.name} 达到上限，请明日再试` : ''
-            }
+            record.dailyCount++
           }
-          updates.push({ recordId, record, maxDayUsage })
+          record.lastUsedAt = now
+          commandRecords.set(recordId, record)
         }
       }
-      cmd = cmd.parent
-    }
-    for (const { recordId, record, maxDayUsage } of updates) {
-      record.lastUsedAt = now
-      if (maxDayUsage > 0) record.dailyCount!++
-      commandRecords.set(recordId, record)
     }
   })
 }
