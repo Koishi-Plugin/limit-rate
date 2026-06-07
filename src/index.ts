@@ -2,8 +2,8 @@ import { Argv, Computed, Context, Schema, Command, Logger } from 'koishi'
 
 interface UsageRecord {
   lastUsedAt?: number
-  dailyCount?: number
-  lastResetDay?: string
+  dailyCount: number
+  lastResetDay: string
 }
 
 declare module 'koishi' {
@@ -42,7 +42,7 @@ export const Config: Schema<Config> = Schema.object({
 })
 
 export function apply(ctx: Context, config: Config) {
-  const commandRecords = new Map<string, UsageRecord>()
+  const commandRecords = new WeakMap<Command, Record<'platform' | 'channel' | 'user', Map<string, UsageRecord>>>()
 
   ctx.schema.extend('command', Schema.object({
     scope: Schema.union([
@@ -57,83 +57,54 @@ export function apply(ctx: Context, config: Config) {
   ctx.before('command/execute', (argv: Argv) => {
     const { session, command } = argv
     if (!session?.userId || !command) return
-    const { userId, channelId } = session
-    if (config.debugMode) logger.info(`[${command.name}] ${userId} 触发指令`)
+    // 获取配置
+    const minInterval = session.resolve(command.config.minInterval) ?? 0
+    const maxDayUsage = session.resolve(command.config.maxDayUsage) ?? 0
+    if (minInterval <= 0 && maxDayUsage <= 0) return
+    // 初始化记录
+    if (!commandRecords.has(command)) {
+      commandRecords.set(command, {
+        platform: new Map(),
+        channel: new Map(),
+        user: new Map(),
+      })
+    }
+    // 获取标识
+    const scope = session.resolve(command.config.scope) ?? 'channel'
+    const targetId = scope === 'user' ? session.uid : (scope === 'channel' ? session.cid : session.platform)
+    const recordMap = commandRecords.get(command)![scope]
     const now = Date.now()
     const today = new Date().toISOString().slice(0, 10)
-    let cmd: Command | undefined = command
-    const cmds: Command[] = []
-    while (cmd) {
-      cmds.push(cmd)
-      cmd = cmd.parent
+    let record = recordMap.get(targetId)
+    // 重置记录
+    if (!record) {
+      record = { dailyCount: 0, lastResetDay: today }
+      recordMap.set(targetId, record)
+    } else if (record.lastResetDay !== today) {
+      record.dailyCount = 0
+      record.lastResetDay = today
     }
-
-    for (const c of cmds) {
-      const minInterval = session.resolve(c.config.minInterval) ?? 0
-      const maxDayUsage = session.resolve(c.config.maxDayUsage) ?? 0
-      if (minInterval > 0 || maxDayUsage > 0) {
-        const scope = session.resolve(c.config.scope) ?? 'channel'
-        let key: string | undefined
-        if (scope === 'user') {
-          key = `${session.platform}:${userId}`
-        } else if (scope === 'channel') {
-          key = `${session.platform}:${channelId || userId}`
-        } else if (scope === 'platform') {
-          key = session.platform
-        }
-        if (key) {
-          const recordId = `${scope}:${key}:${c.name}`
-          const record = commandRecords.get(recordId)
-          if (record) {
-            if (minInterval > 0 && record.lastUsedAt) {
-              const cooldownTime = record.lastUsedAt + minInterval * 1000
-              if (cooldownTime > now) {
-                const remaining = Math.ceil((cooldownTime - now) / 1000)
-                if (config.debugMode) logger.info(`[${c.name}] 触发 ${remaining}s 冷却`)
-                return config.sendHint ? `操作过于频繁，请等 ${remaining} 秒后重试` : ''
-              }
-            }
-            if (maxDayUsage > 0) {
-              if (record.lastResetDay === today && (record.dailyCount ?? 0) >= maxDayUsage) {
-                if (config.debugMode) logger.info(`[${c.name}] 触发上限`)
-                return config.sendHint ? `今日使用 ${c.name} 达到上限，请明日再试` : ''
-              }
-            }
-          }
-        }
+    if (config.debugMode) logger.info(`[${command.name}] ${session.userId} 正在执行指令`)
+    // 校验冷却间隔
+    if (minInterval > 0 && record.lastUsedAt) {
+      const cooldownTime = record.lastUsedAt + minInterval * 1000
+      if (cooldownTime > now) {
+        const remaining = Math.ceil((cooldownTime - now) / 1000)
+        if (config.debugMode) logger.info(`[${command.name}] 触发 ${remaining}s 冷却`)
+        return config.sendHint ? `操作过于频繁，请等 ${remaining} 秒后重试` : ''
       }
     }
-    for (const c of cmds) {
-      const minInterval = session.resolve(c.config.minInterval) ?? 0
-      const maxDayUsage = session.resolve(c.config.maxDayUsage) ?? 0
-      if (minInterval > 0 || maxDayUsage > 0) {
-        const scope = session.resolve(c.config.scope) ?? 'channel'
-        let key: string | undefined
-        if (scope === 'user') {
-          key = `${session.platform}:${userId}`
-        } else if (scope === 'channel') {
-          key = `${session.platform}:${channelId || userId}`
-        } else if (scope === 'platform') {
-          key = session.platform
-        }
-        if (key) {
-          const recordId = `${scope}:${key}:${c.name}`
-          const record = commandRecords.get(recordId) ?? { dailyCount: 0, lastResetDay: today }
-          record.dailyCount ??= 0
-          record.lastResetDay ??= today
-          const lastUsedStr = record.lastUsedAt ? new Date(record.lastUsedAt).toLocaleString() : '无'
-          if (config.debugMode) logger.info(`[${c.name}] 范围:${scope} | 配置:[间隔 ${minInterval}s | 上限 ${maxDayUsage}] | 状态:[已用 ${record.dailyCount} | 上次 ${lastUsedStr}]`)
-          if (maxDayUsage > 0) {
-            if (record.lastResetDay !== today) {
-              record.lastResetDay = today
-              record.dailyCount = 0
-            }
-            record.dailyCount++
-          }
-          record.lastUsedAt = now
-          commandRecords.set(recordId, record)
-        }
-      }
+    // 校验每日上限
+    if (maxDayUsage > 0 && record.dailyCount >= maxDayUsage) {
+      if (config.debugMode) logger.info(`[${command.name}] 触发今日上限`)
+      return config.sendHint ? `今日使用 ${command.name} 达到上限，请明日再试` : ''
     }
+    // 更新并执行指令
+    if (config.debugMode) {
+      const lastUsedStr = record.lastUsedAt ? new Date(record.lastUsedAt).toLocaleString() : '无'
+      logger.info(`[${command.name}] 状态: 范围:${scope} | 已用 ${record.dailyCount}/${maxDayUsage} | 上次: ${lastUsedStr}`)
+    }
+    record.lastUsedAt = now
+    if (maxDayUsage > 0) record.dailyCount++
   })
 }
